@@ -95,6 +95,7 @@ class _Proxy(object):
 
 
 class _IDProxy(_Proxy):
+
     def __init__(self, objs, index):
         self._index = index
         self._objs = objs
@@ -107,8 +108,51 @@ def _obj_setattr(obj, attr, proxy):
     setattr(obj, attr, proxy.get())
 
 
-def _obj_setvalue(obj, idx, proxy):
+def _obj_setitem(obj, idx, proxy):
     obj[idx] = proxy.get()
+
+
+def _resolve_proxy(proxy):
+    if isinstance(proxy, _Proxy):
+        result = proxy.get()
+    else:
+        result = proxy
+    return result
+
+
+def _setattr(obj, attr, value):
+    setattr(obj, attr, value)
+
+
+def _setitem(obj, attr, value):
+    obj[attr] = value
+
+
+def _is_proxy(value):
+    return isinstance(value, _Proxy)
+
+
+def _is_tuple_with_proxy(values):
+    return isinstance(values, tuple) and any([_is_proxy(x) for x in values])
+
+
+def _obj_store_tuple(obj, attr, method, values, tuples):
+    """Recreate tuples after resolving references and update references"""
+    try:
+        instance = tuples[id(values)]
+    except KeyError:
+        instance = tuples[id(values)] = tuple(
+            [_resolve_proxy(x) for x in values])
+    method(obj, attr, instance)
+    return instance
+
+
+def _obj_setattr_tuple(obj, attr, value, tuples):
+    _obj_store_tuple(obj, attr, _setattr, value, tuples)
+
+
+def _obj_setitem_tuple(obj, attr, value, tuples):
+    _obj_store_tuple(obj, attr, _setitem, value, tuples)
 
 
 class Unpickler(object):
@@ -133,6 +177,8 @@ class Unpickler(object):
         self._obj_to_idx = {}
         self._objs = []
         self._proxies = []
+        self._tuples = {}
+        self._tuples_with_proxies = []
 
         # Extra local classes not accessible globally
         self._classes = {}
@@ -175,6 +221,11 @@ class Unpickler(object):
         for (obj, attr, proxy, method) in self._proxies:
             method(obj, attr, proxy)
         self._proxies = []
+
+        for (obj, attr, proxy, method) in self._tuples_with_proxies:
+            method(obj, attr, proxy, self._tuples)
+
+        self._tuples_with_proxies = []
 
     def _restore(self, obj):
         if has_tag(obj, tags.B64):
@@ -400,6 +451,7 @@ class Unpickler(object):
     def _restore_from_dict(self, obj, instance, ignorereserved=True):
         restore_key = self._restore_key_fn()
         method = _obj_setattr
+        tuple_method = _obj_setattr_tuple
         deferred = {}
 
         for k, v in util.items(obj):
@@ -430,10 +482,8 @@ class Unpickler(object):
             else:
                 setattr(instance, k, value)
 
-            # This instance has an instance variable named `k` that is
-            # currently a proxy and must be replaced
-            if isinstance(value, _Proxy):
-                self._proxies.append((instance, k, value, method))
+            self._add_proxy(instance, k, value, method)
+            self._add_tuple_proxy(instance, k, value, tuple_method)
 
             # step out
             self._namestack.pop()
@@ -443,6 +493,20 @@ class Unpickler(object):
             instance = instance.__class__(deferred)
 
         return instance
+
+    def _add_proxy(self, instance, k, value, method):
+        # This instance has an instance variable named `k` that is
+        # currently a proxy and must be replaced
+        if _is_proxy(value):
+            self._proxies.append((instance, k, value, method))
+
+    def add_tuple_attr(self, instance, k):
+        """Public API to register an object with a tuple attribute"""
+        self._add_tuple_proxy(instance, k, getattr(instance, k), _obj_setattr_tuple)
+
+    def _add_tuple_proxy(self, instance, k, values, method):
+        if _is_tuple_with_proxy(values):
+            self._tuples_with_proxies.append((instance, k, values, method))
 
     def _restore_object_instance_variables(self, obj, instance):
         instance = self._restore_from_dict(obj, instance)
@@ -494,13 +558,21 @@ class Unpickler(object):
         self._mkref(parent)
         children = [self._restore(v) for v in obj]
         parent.extend(children)
-        method = _obj_setvalue
+        method = _obj_setitem
         proxies = [
             (parent, idx, value, method)
-            for idx, value in enumerate(parent)
-            if isinstance(value, _Proxy)
+            for (idx, value) in enumerate(parent)
+            if _is_proxy(value)
         ]
         self._proxies.extend(proxies)
+
+        tuple_method = _obj_setitem_tuple
+        tuples_with_proxies = [
+            (parent, idx, value, tuple_method)
+            for (idx, value) in enumerate(parent)
+            if _is_tuple_with_proxy(value)
+        ]
+        self._tuples_with_proxies.extend(tuples_with_proxies)
         return parent
 
     def _restore_tuple(self, obj):
@@ -526,23 +598,23 @@ class Unpickler(object):
                 else:
                     str_k = k
                 self._namestack.append(str_k)
-                data[k] = self._restore(v)
-
+                data[k] = result = self._restore(v)
                 self._namestack.pop()
+
+                self._add_proxy(data, k, result, _obj_setitem)
+                self._add_tuple_proxy(data, k, result, _obj_setitem_tuple)
 
             # Phase 2: object keys only.
             for k, v in util.items(obj):
                 if not _is_json_key(k):
                     continue
                 self._namestack.append(k)
-
                 k = self._restore_pickled_key(k)
                 data[k] = result = self._restore(v)
-                # k is currently a proxy and must be replaced
-                if isinstance(result, _Proxy):
-                    self._proxies.append((data, k, result, _obj_setvalue))
-
                 self._namestack.pop()
+
+                self._add_proxy(data, k, result, _obj_setitem)
+                self._add_tuple_proxy(data, k, result, _obj_setitem_tuple)
         else:
             # No special keys, thus we don't need to restore the keys either.
             for k, v in util.items(obj):
@@ -551,8 +623,11 @@ class Unpickler(object):
                 else:
                     str_k = k
                 self._namestack.append(str_k)
-                data[k] = self._restore(v)
+                data[k] = result = self._restore(v)
                 self._namestack.pop()
+
+                self._add_proxy(data, k, result, _obj_setitem)
+                self._add_tuple_proxy(data, k, result, _obj_setitem_tuple)
         return data
 
     def _restore_key_fn(self):
